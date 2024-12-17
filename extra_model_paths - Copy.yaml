@@ -23,7 +23,7 @@ a111:
     clip_vision: models/clip_vision
     ipadapter: models/ipadapter
     clip: models/clip
-    simswap: models
+    simswap: models/simswap
     
 #config for comfyui
 #your base path should be either an existing comfy install or a central folder where you store all of your models, loras, etc.
