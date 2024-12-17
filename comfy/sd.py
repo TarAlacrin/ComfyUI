@@ -1,8 +1,10 @@
+from __future__ import annotations
 import torch
 from enum import Enum
 import logging
 
 from comfy import model_management
+from comfy.utils import ProgressBar
 from .ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
 from .ldm.cascade.stage_a import StageA
 from .ldm.cascade.stage_c_coder import StageC_coder
@@ -29,10 +31,12 @@ import comfy.text_encoders.flux
 import comfy.text_encoders.long_clipl
 import comfy.text_encoders.genmo
 import comfy.text_encoders.lt
+import comfy.text_encoders.hunyuan_video
 
 import comfy.model_patcher
 import comfy.lora
 import comfy.lora_convert
+import comfy.hooks
 import comfy.t2i_adapter.adapter
 import comfy.taesd.taesd
 
@@ -98,9 +102,13 @@ class CLIP:
 
         self.tokenizer = tokenizer(embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
         self.patcher = comfy.model_patcher.ModelPatcher(self.cond_stage_model, load_device=load_device, offload_device=offload_device)
+        self.patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+        self.patcher.is_clip = True
+        self.apply_hooks_to_conds = None
         if params['device'] == load_device:
             model_management.load_models_gpu([self.patcher], force_full_load=True)
         self.layer_idx = None
+        self.use_clip_schedule = False
         logging.debug("CLIP model load device: {}, offload device: {}, current: {}".format(load_device, offload_device, params['device']))
 
     def clone(self):
@@ -109,6 +117,8 @@ class CLIP:
         n.cond_stage_model = self.cond_stage_model
         n.tokenizer = self.tokenizer
         n.layer_idx = self.layer_idx
+        n.use_clip_schedule = self.use_clip_schedule
+        n.apply_hooks_to_conds = self.apply_hooks_to_conds
         return n
 
     def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
@@ -119,6 +129,69 @@ class CLIP:
 
     def tokenize(self, text, return_word_ids=False):
         return self.tokenizer.tokenize_with_weights(text, return_word_ids)
+
+    def add_hooks_to_dict(self, pooled_dict: dict[str]):
+        if self.apply_hooks_to_conds:
+            pooled_dict["hooks"] = self.apply_hooks_to_conds
+        return pooled_dict
+
+    def encode_from_tokens_scheduled(self, tokens, unprojected=False, add_dict: dict[str]={}, show_pbar=True):
+        all_cond_pooled: list[tuple[torch.Tensor, dict[str]]] = []
+        all_hooks = self.patcher.forced_hooks
+        if all_hooks is None or not self.use_clip_schedule:
+            # if no hooks or shouldn't use clip schedule, do unscheduled encode_from_tokens and perform add_dict
+            return_pooled = "unprojected" if unprojected else True
+            pooled_dict = self.encode_from_tokens(tokens, return_pooled=return_pooled, return_dict=True)
+            cond = pooled_dict.pop("cond")
+            # add/update any keys with the provided add_dict
+            pooled_dict.update(add_dict)
+            all_cond_pooled.append([cond, pooled_dict])
+        else:
+            scheduled_keyframes = all_hooks.get_hooks_for_clip_schedule()
+
+            self.cond_stage_model.reset_clip_options()
+            if self.layer_idx is not None:
+                self.cond_stage_model.set_clip_options({"layer": self.layer_idx})
+            if unprojected:
+                self.cond_stage_model.set_clip_options({"projected_pooled": False})
+
+            self.load_model()
+            all_hooks.reset()
+            self.patcher.patch_hooks(None)
+            if show_pbar:
+                pbar = ProgressBar(len(scheduled_keyframes))
+
+            for scheduled_opts in scheduled_keyframes:
+                t_range = scheduled_opts[0]
+                # don't bother encoding any conds outside of start_percent and end_percent bounds
+                if "start_percent" in add_dict:
+                    if t_range[1] < add_dict["start_percent"]:
+                        continue
+                if "end_percent" in add_dict:
+                    if t_range[0] > add_dict["end_percent"]:
+                        continue
+                hooks_keyframes = scheduled_opts[1]
+                for hook, keyframe in hooks_keyframes:
+                    hook.hook_keyframe._current_keyframe = keyframe
+                # apply appropriate hooks with values that match new hook_keyframe
+                self.patcher.patch_hooks(all_hooks)
+                # perform encoding as normal
+                o = self.cond_stage_model.encode_token_weights(tokens)
+                cond, pooled = o[:2]
+                pooled_dict = {"pooled_output": pooled}
+                # add clip_start_percent and clip_end_percent in pooled
+                pooled_dict["clip_start_percent"] = t_range[0]
+                pooled_dict["clip_end_percent"] = t_range[1]
+                # add/update any keys with the provided add_dict
+                pooled_dict.update(add_dict)
+                # add hooks stored on clip
+                self.add_hooks_to_dict(pooled_dict)
+                all_cond_pooled.append([cond, pooled_dict])
+                if show_pbar:
+                    pbar.update(1)
+                model_management.throw_exception_if_processing_interrupted()
+            all_hooks.reset()
+        return all_cond_pooled
 
     def encode_from_tokens(self, tokens, return_pooled=False, return_dict=False):
         self.cond_stage_model.reset_clip_options()
@@ -137,6 +210,7 @@ class CLIP:
             if len(o) > 2:
                 for k in o[2]:
                     out[k] = o[2][k]
+            self.add_hooks_to_dict(out)
             return out
 
         if return_pooled:
@@ -233,12 +307,23 @@ class VAE:
                     self.upscale_ratio = 4
 
                 self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.weight"].shape[1]
-                if 'quant_conv.weight' in sd:
-                    self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=4)
+                if 'post_quant_conv.weight' in sd:
+                    self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
                 else:
                     self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                                 encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': ddconfig},
                                                                 decoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Decoder", 'params': ddconfig})
+            elif "decoder.conv_in.conv.weight" in sd:
+                ddconfig = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128, 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
+                ddconfig["conv3d"] = True
+                ddconfig["time_compress"] = 4
+                self.upscale_ratio = (lambda a: max(0, a * 4 - 3), 8, 8)
+                self.latent_dim = 3
+                self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.conv.weight"].shape[1]
+                self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
+                self.memory_used_decode = lambda shape, dtype: (1500 * shape[2] * shape[3] * shape[4] * (4 * 8 * 8)) * model_management.dtype_size(dtype)
+                self.memory_used_encode = lambda shape, dtype: (900 * max(shape[2], 2) * shape[3] * shape[4]) * model_management.dtype_size(dtype)
+
             elif "decoder.layers.1.layers.0.beta" in sd:
                 self.first_stage_model = AudioOobleckVAE()
                 self.memory_used_encode = lambda shape, dtype: (1000 * shape[2]) * model_management.dtype_size(dtype)
@@ -362,7 +447,7 @@ class VAE:
                 if pixel_samples is None:
                     pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
                 pixel_samples[x:x+batch_number] = out
-        except model_management.OOM_EXCEPTION as e:
+        except model_management.OOM_EXCEPTION:
             logging.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
             dims = samples_in.ndim - 2
             if dims == 1:
@@ -417,7 +502,7 @@ class VAE:
                     samples = torch.empty((pixel_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
                 samples[x:x + batch_number] = out
 
-        except model_management.OOM_EXCEPTION as e:
+        except model_management.OOM_EXCEPTION:
             logging.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
             if len(pixel_samples.shape) == 3:
                 samples = self.encode_tiled_1d(pixel_samples)
@@ -471,6 +556,7 @@ class CLIPType(Enum):
     FLUX = 6
     MOCHI = 7
     LTXV = 8
+    HUNYUAN_VIDEO = 9
 
 def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}):
     clip_data = []
@@ -486,6 +572,7 @@ class TEModel(Enum):
     T5_XXL = 4
     T5_XL = 5
     T5_BASE = 6
+    LLAMA3_8 = 7
 
 def detect_te_model(sd):
     if "text_model.encoder.layers.30.mlp.fc1.weight" in sd:
@@ -502,6 +589,8 @@ def detect_te_model(sd):
             return TEModel.T5_XL
     if "encoder.block.0.layer.0.SelfAttention.k.weight" in sd:
         return TEModel.T5_BASE
+    if "model.layers.0.post_attention_layernorm.weight" in sd:
+        return TEModel.LLAMA3_8
     return None
 
 
@@ -579,6 +668,9 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
         elif clip_type == CLIPType.FLUX:
             clip_target.clip = comfy.text_encoders.flux.flux_clip(**t5xxl_detect(clip_data))
             clip_target.tokenizer = comfy.text_encoders.flux.FluxTokenizer
+        elif clip_type == CLIPType.HUNYUAN_VIDEO:
+            clip_target.clip = comfy.text_encoders.hunyuan_video.hunyuan_video_clip() #TODO
+            clip_target.tokenizer = comfy.text_encoders.hunyuan_video.HunyuanVideoTokenizer
         else:
             clip_target.clip = sdxl_clip.SDXLClipModel
             clip_target.tokenizer = sdxl_clip.SDXLTokenizer
@@ -618,7 +710,6 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
             config = yaml.safe_load(stream)
     model_config_params = config['model']['params']
     clip_config = model_config_params['cond_stage_config']
-    scale_factor = model_config_params['scale_factor']
 
     if "parameterization" in model_config_params:
         if model_config_params["parameterization"] == "v":
